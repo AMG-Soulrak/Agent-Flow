@@ -9,3 +9,7 @@ Panel informativo en vivo para Claude Code (escritorio y terminal): muestra qué
 ## Instalación
 
 Copia esta carpeta en la carpeta de mods de Claude Code y reinicia la sesión.
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).
