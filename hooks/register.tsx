@@ -2,14 +2,18 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { FlowNode } from '../types'
-import { IDLE_MS, MAIN_ID, ZOOMS, addFile, addMcp, addSkill, drawFlow, friendlyMcp, termRows, termShort, mcpOf, mkMain, mkNode, shortModel } from './flow'
+import { IDLE_MS, MAIN_ID, ZOOMS, addFile, addMcp, addSkill, addTool, aliveSet, colorOf, drawFlow, friendlyMcp, termRows, termShort, mcpOf, mkMain, mkNode, shortModel } from './flow'
 
 const PANE = 'agent-flow'
 // Cambia la etiqueta si cambian los campos de un nodo: descarta lo guardado.
-const nodes = atom({ plugin: 'agent-flow', key: 'nodes' } as const, {} as Record<string, FlowNode>, { shape: 'nodes-3' })
+const nodes = atom({ plugin: 'agent-flow', key: 'nodes' } as const, {} as Record<string, FlowNode>, { shape: 'nodes-4' })
 const zoom = atom({ plugin: 'agent-flow', key: 'zoom' } as const, 2)
+const briefs = atom({ plugin: 'agent-flow', key: 'briefs' } as const, false)
 
-type Patch = Partial<Pick<FlowNode, 'status' | 'tool' | 'desc' | 'model' | 'effort' | 'result'>> & {
+type Patch = Partial<Pick<FlowNode, 'status' | 'tool' | 'desc' | 'prompt' | 'ask' | 'model' | 'effort' | 'result'>> & {
+  toolName?: string
+  // reloj del motor en el momento del evento (las escrituras se agrupan, el evento ocurrió antes)
+  at?: number
   skill?: string
   mcp?: { server: string; tool: string }
   file?: { path: string; mode: 'read' | 'write' }
@@ -44,27 +48,45 @@ const lastWrite = new Map<string, number>()
 const pending = new Map<string, Patch[]>()
 let flushing = false
 
+type Span = [number, number]
+
 function apply(n: FlowNode, p: Patch, now: number): FlowNode {
+  const at = p.at ?? now
   if (p.status) {
-    if (p.status === 'active' && n.status !== 'active' && n.status !== 'waiting') n = { ...n, started: now }
+    const was = n.status
+    // empieza un tramo de trabajo; si pasa a esperar permiso, empieza una espera; al salir de ella, se cierra
+    if (p.status === 'active' && was !== 'active' && was !== 'waiting') n = { ...n, started: now, runs: [...n.runs, [now, now] as Span].slice(-12) }
+    if (p.status === 'waiting' && was !== 'waiting') n = { ...n, askAt: now, waits: [...n.waits, [now, 0] as Span].slice(-12) }
+    if (was === 'waiting' && p.status !== 'waiting') n = { ...n, waits: n.waits.map((w, i) => (i === n.waits.length - 1 && !w[1] ? ([w[0], now] as Span) : w)) }
     n = { ...n, status: p.status }
+    if (p.status !== 'waiting') n = { ...n, ask: '' }
   }
+  if (p.ask) n = { ...n, ask: p.ask }
   if (p.tool !== undefined) n = { ...n, tool: p.tool }
   if (p.desc) n = { ...n, desc: p.desc }
+  if (p.prompt) n = { ...n, prompt: p.prompt }
   if (p.model) n = { ...n, model: p.model }
   if (p.effort) n = { ...n, effort: p.effort }
   if (p.result !== undefined) n = { ...n, result: p.result }
-  if (p.isCall) n = { ...n, tools: n.tools + 1 }
+  if (p.isCall) n = { ...n, tools: n.tools + 1, marks: [...n.marks.filter(t => t > at - IDLE_MS), at].slice(-60) }
+  if (p.toolName) n = addTool(n, p.toolName, now)
   if (p.skill) n = addSkill(n, p.skill, now)
   if (p.mcp) n = addMcp(n, p.mcp.server, p.mcp.tool, now)
   if (p.file) n = addFile(n, p.file.path, p.file.mode, now)
-  if (p.error) n = { ...n, errors: n.errors + 1, lastError: p.error }
+  if (p.error) n = { ...n, errors: n.errors + 1, lastError: p.error, errAt: [...n.errAt.filter(t => t > at - IDLE_MS), at].slice(-30) }
+  // mientras trabaja o espera, el tramo abierto llega hasta ahora
+  if ((n.status === 'active' || n.status === 'waiting') && n.runs.length) {
+    const r = n.runs.slice()
+    r[r.length - 1] = [r[r.length - 1][0], now]
+    n = { ...n, runs: r }
+  }
   return n
 }
 
 async function touch($: any, id: string | undefined, p: Patch, spawn?: { parent: string | null; type: string; desc: string }) {
   const key = id ?? MAIN_ID
   const now = await $.clock.now()
+  p = { ...p, at: now }
   const known = (await read($, nodes))[key]
   const isMinor = known && !spawn && !p.skill && !p.mcp && !p.error && p.result === undefined && (!p.status || p.status === known.status)
   if (isMinor && now - (lastWrite.get(key) ?? 0) < 2000) {
@@ -112,8 +134,10 @@ export const register: Register = on => {
     await $.command.register({ name: 'flow', description: 'Abre el panel de flujo de agentes' })
     void $.ui.open({ id: PANE, title: 'Flujo de agentes' })
 
-    // Solo se redibuja si hay algo que mostrar y cada 30 s: lo justo para los contadores y el ocultado.
-    $.clock.every(30000, async () => {
+    // Solo se redibuja si hay algo que mostrar: cada 30 s para los contadores y el ocultado, y cada 10 s mientras
+    // algún agente espera tu permiso (para que su cronómetro avance sin que el resto parpadee de más).
+    let tick = 0
+    $.clock.every(10000, async () => {
       const mine = await read($, nodes)
       const list: any[] = await $.agent.list()
       for (const a of list) {
@@ -121,7 +145,8 @@ export const register: Register = on => {
         if ((cur === 'active' || cur === 'waiting') && ['completed'].includes(a.status)) await touch($, a.id, { status: 'done' })
         if ((cur === 'active' || cur === 'waiting') && ['failed', 'killed'].includes(a.status)) await touch($, a.id, { status: 'failed' })
       }
-      if (Object.keys(mine).length) $.ui.invalidate('ui.render')
+      const waiting = Object.values(mine).some(n => n.status === 'waiting')
+      if (Object.keys(mine).length && (waiting || ++tick % 3 === 0)) $.ui.invalidate('ui.render')
     })
     return next(e)
   })
@@ -135,7 +160,7 @@ export const register: Register = on => {
     const r = await next(e)
     const row = r.agentId ? (await Promise.resolve($.agent.list()).catch(() => [])).find((x: any) => x.id === r.agentId) : undefined
     const effort = row?.effort ?? (e as any).effort
-    if (r.agentId) await touch($, r.agentId, { status: 'active', model: shortModel(r.model ?? e.model ?? ''), effort: effort == null ? undefined : String(effort) },{ parent: e.parentAgentId ?? MAIN_ID, type: e.subagentType, desc: e.description })
+    if (r.agentId) await touch($, r.agentId, { status: 'active', model: shortModel(r.model ?? e.model ?? ''), effort: effort == null ? undefined : String(effort), prompt: cut(String((e as any).prompt ?? '').trim(), 1200) }, { parent: e.parentAgentId ?? MAIN_ID, type: e.subagentType, desc: e.description })
     return r
   })
 
@@ -151,6 +176,8 @@ export const register: Register = on => {
       status: 'active',
       tool: label(e),
       isCall: true,
+      // las herramientas con columna propia (MCP, skills) no se repiten en la de herramientas
+      toolName: e.tool !== 'Skill' && !mcpOf(String(e.tool)) ? String(e.tool) : undefined,
       skill: e.tool === 'Skill' ? String((e as any).skill ?? '') || undefined : undefined,
       mcp: mcpOf(String(e.tool)) ?? undefined,
       file: fileOf(e),
@@ -168,7 +195,9 @@ export const register: Register = on => {
   on('tool.check', async ($, e, next) => {
     const r = await next(e)
     if (r.decision === 'ask') {
-      await touch($, e.agentId, { status: 'waiting', tool: label(e) })
+      // qué pide, completo (el comando entero en Bash, la ruta en Edit…)
+      const what = oneLine(`${e.tool} ${(e as any).command ?? (e as any).file_path ?? (e as any).path ?? (e as any).url ?? (e as any).pattern ?? ''}`)
+      await touch($, e.agentId, { status: 'waiting', tool: label(e), ask: cut(what, 160) })
       const n = (await read($, nodes))[e.agentId ?? MAIN_ID]
       $.ui.toast(`${n?.type ?? 'Un agente'} espera tu permiso (${e.tool})`)
     }
@@ -185,19 +214,30 @@ export const register: Register = on => {
     const { Box, Svg, Text, Button } = $.ui.resolve(e)
     const z = await read($, zoom)
     const now = await $.clock.now()
+    const all = await read($, nodes)
+    const showBriefs = await read($, briefs)
+    const toggleBriefs = () => update($, briefs, v => !v)
+    // encargos completos de los subagentes que siguen visibles, del más antiguo al más nuevo
+    const alive = aliveSet(all, now).ok
+    const briefList = Object.values(all)
+      .filter(n => n.id !== MAIN_ID && alive.has(n.id) && (n.prompt || n.desc))
+      .sort((a, b) => a.started - b.started)
     if (e.surface === 'terminal') {
-      const rows = termRows(await read($, nodes), now)
+      const rows = termRows(all, now)
       const { cut: c, base: b, friendly } = termShort
       return (
         <Box flexDirection="column">
           <Box gap={1}>
+            <Button key="briefs" label={showBriefs ? 'Ocultar encargos' : 'Encargos'} onPress={toggleBriefs} />
             <Button key="clear" label="Limpiar" onPress={() => update($, nodes, () => ({}))} />
             <Text dimColor>{rows.filter(x => x.live).length} activos · {rows.length} agentes</Text>
           </Box>
           {rows.length === 0 && <Text dimColor>Sin actividad en los últimos 5 minutos.</Text>}
+          {rows.length > 0 && <Text dimColor>⏱ últimos 5 min, 10 s por casilla: ▃ trabaja · █ herramienta · ▒ espera permiso · ✖ fallo</Text>}
           {rows.map(x => {
             const n = x.node
             const pad = '  '.repeat(x.depth) + (x.depth ? '└ ' : '')
+            const ind = '  '.repeat(x.depth) + (x.depth ? '  ' : '')
             return (
               <Box key={n.id} flexDirection="column" marginTop={1}>
                 <Text>
@@ -206,32 +246,49 @@ export const register: Register = on => {
                   <Text bold color={x.color}>{n.type}</Text>
                   <Text dimColor> {x.statusLabel} · {x.age}{n.model ? ' · ' + n.model + (n.effort ? ' · ' + n.effort : '') : ''}</Text>
                 </Text>
-                <Text dimColor>{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}{c(n.desc || 'sin descripción', 90)}</Text>
+                <Text dimColor>{ind}{c(n.desc || 'sin descripción', 90)}</Text>
+                {showBriefs && n.prompt ? <Text dimColor>{ind}“{n.prompt}”</Text> : null}
+                {n.status === 'waiting' && n.ask ? <Text color="#ffb020">{ind}⏸ pide permiso: {c(n.ask, 120)}</Text> : null}
                 {n.tool ? <Text color={x.live ? x.color : undefined} dimColor={!x.live}>{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}⚙ {c(n.tool, 80)}</Text> : null}
+                {n.toolUse.length ? <Text color="#ffe066">{ind}≡ {n.toolUse.map(t => t.name + '×' + t.n).join(', ')}</Text> : null}
                 {n.skills.length ? <Text color="#b197fc">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}✦ {n.skills.map(s => s.name.replace(/^.*:/, '')).join(', ')}</Text> : null}
                 {n.mcp.length ? <Text color="#38d9a9">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}⛓ {n.mcp.map(m => friendly(m.server) + '·' + m.tool).join(', ')}</Text> : null}
                 {n.files.length ? <Text color="#ffa94d">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}▤ {n.files.map(f => (f.w ? '✎' : '') + b(f.path)).join(', ')}</Text> : null}
                 {n.lastError ? <Text color="#ff6b6b">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}⚠ {c(n.lastError, 90)}</Text> : null}
                 {n.result && !x.live ? <Text color="#8fd3b6">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}↳ {c(n.result, 110)}</Text> : null}
+                <Text>{ind}<Text dimColor>⏱ </Text>{x.line.map((seg, i) => <Text key={i} color={seg[1]} dimColor={!seg[1]}>{seg[0]}</Text>)}</Text>
               </Box>
             )
           })}
         </Box>
       )
     }
-    const { source, alt, W, H, counts } = drawFlow(await read($, nodes), now, ZOOMS[z] ?? 1)
+    const { source, alt, W, H, counts } = drawFlow(all, now, ZOOMS[z] ?? 1)
     const bump = (d: number) => () => update($, zoom, n => Math.min(ZOOMS.length - 1, Math.max(0, n + d)))
     return (
       <Box flexDirection="column" alignItems="flex-start">
         <Box gap={1}>
           <Button key="out" label="−" onPress={bump(-1)} />
           <Button key="in" label="+" onPress={bump(1)} />
+          <Button key="briefs" label={showBriefs ? 'Ocultar encargos' : 'Encargos'} onPress={toggleBriefs} />
           <Button key="clear" label="Limpiar" onPress={() => update($, nodes, () => ({}))} />
           <Text dimColor>
-            {counts.active} activos · {counts.total} agentes · {counts.skills} skills · {counts.mcp} MCP · {counts.files} archivos{counts.errors ? ` · ${counts.errors} fallos` : ''} · zoom {Math.round((ZOOMS[z] ?? 1) * 100)}%
+            {counts.active} activos · {counts.total} agentes · {counts.skills} skills · {counts.mcp} MCP · {counts.tools} herramientas · {counts.files} archivos{counts.errors ? ` · ${counts.errors} fallos` : ''} · zoom {Math.round((ZOOMS[z] ?? 1) * 100)}%
           </Text>
         </Box>
         <Svg source={source} alt={alt} width={Math.round(W * (ZOOMS[z] ?? 1))} height={Math.round(H * (ZOOMS[z] ?? 1))} />
+        {showBriefs && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>ENCARGOS</Text>
+            {briefList.length === 0 && <Text dimColor>Ningún subagente visible.</Text>}
+            {briefList.map(n => (
+              <Box key={n.id} flexDirection="column" marginTop={1}>
+                <Text bold color={colorOf(n.type)}>{n.type}{n.desc ? ' · ' + n.desc : ''}</Text>
+                <Text dimColor>{n.prompt || 'Sin texto de encargo.'}</Text>
+              </Box>
+            ))}
+          </Box>
+        )}
       </Box>
     )
   })

@@ -12,11 +12,19 @@ export const mkNode = (id: string, parent: string | null, type: string, desc: st
   parent,
   type,
   desc,
+  prompt: '',
   status: 'active',
   tool: '',
   skills: [],
   mcp: [],
   files: [],
+  toolUse: [],
+  ask: '',
+  askAt: 0,
+  marks: [],
+  errAt: [],
+  waits: [],
+  runs: [[now, now]],
   model: '',
   errors: 0,
   lastError: '',
@@ -26,12 +34,18 @@ export const mkNode = (id: string, parent: string | null, type: string, desc: st
   last: now,
 })
 
-export const mkMain = (now: number): FlowNode => ({ ...mkNode(MAIN_ID, null, 'Claude', 'Sesión principal', now), status: 'idle' })
+export const mkMain = (now: number): FlowNode => ({ ...mkNode(MAIN_ID, null, 'Claude', 'Sesión principal', now), status: 'idle', runs: [] })
 
 // Los últimos 8 skills usados, sin repetir: usar uno ya visto lo pasa al final y suma un uso.
 export const addSkill = (n: FlowNode, name: string, now: number): FlowNode => {
   const old = n.skills.find(s => s.name === name)
   return { ...n, skills: [...n.skills.filter(s => s.name !== name), { name, at: now, n: (old?.n ?? 0) + 1 }].slice(-8) }
+}
+
+// Las últimas 10 herramientas propias del motor (Bash, Read…), con cuántas veces se usó cada una.
+export const addTool = (n: FlowNode, name: string, now: number): FlowNode => {
+  const old = n.toolUse.find(s => s.name === name)
+  return { ...n, toolUse: [...n.toolUse.filter(s => s.name !== name), { name, at: now, n: (old?.n ?? 0) + 1 }].slice(-10) }
 }
 
 // Los últimos 8 archivos tocados: cuenta lecturas y escrituras por separado.
@@ -143,6 +157,8 @@ const READ_COLOR = '#4dabf7'
 const WRITE_COLOR = '#ffa94d'
 const ERR_COLOR = '#ff6b6b'
 const MODEL_COLOR = '#c9a7ff'
+const TOOL_COLOR = '#ffe066'
+const WAIT_COLOR = '#ffb020'
 
 export const STATUS = {
   active: { color: '#3ddc84', label: 'activo' },
@@ -207,12 +223,12 @@ const chip = (x: number, y: number, txt: string, c: string) => {
   return { w, svg: `<rect x="${x}" y="${y}" width="${w}" height="16" rx="8" fill="${c}" fill-opacity=".16" stroke="${c}" stroke-opacity=".6"/>` + T(x + 7, y + 11.5, 10, c, esc(txt), ' font-weight="600"') }
 }
 
-const card = (n: FlowNode, x: number, y: number, now: number) => {
+const card = (n: FlowNode, x: number, y: number, now: number, lite = 0) => {
   const color = colorOf(n.type)
   const st = STATUS[n.status]
   const live = n.status === 'active' || n.status === 'waiting'
   const hasResult = (n.status === 'done' || n.status === 'failed') && n.result
-  const age = n.status === 'active' ? 'activo · ' + fmt(now - n.started) : n.status === 'waiting' ? 'espera tu permiso' : st.label + ' · hace ' + fmt(now - n.last)
+  const age = n.status === 'active' ? 'activo · ' + fmt(now - n.started) : n.status === 'waiting' ? 'espera · ' + fmt(now - (n.askAt || n.last)) : st.label + ' · hace ' + fmt(now - n.last)
   const lines = wrap(n.desc || 'sin descripción', 40, 2)
   let s = ''
   if (live) s += `<rect x="${x - 3}" y="${y - 3}" width="${CARD_W + 6}" height="${CARD_H + 6}" rx="15" fill="none" stroke="${st.color}" stroke-width="2.5" opacity=".2"><animate attributeName="opacity" values=".15;.6;.15" dur="${n.status === 'waiting' ? '0.9s' : '1.8s'}" repeatCount="indefinite"/></rect>`
@@ -227,6 +243,9 @@ const card = (n: FlowNode, x: number, y: number, now: number) => {
     const r = wrap(n.result, 40, 2)
     s += T(x + 17, y + 77, 11, n.status === 'failed' ? ERR_COLOR : '#8fd3b6', esc('↳ ' + r[0]), ' font-weight="600"')
     if (r[1]) s += T(x + 29, y + 91, 11, '#8fd3b6', esc(r[1]))
+  } else if (n.status === 'waiting') {
+    s += T(x + 17, y + 77, 11, WAIT_COLOR, esc('⏸ pide permiso · ' + fmt(now - (n.askAt || n.last))), ' font-weight="700"')
+    s += T(x + 17, y + 91, 10.5, '#ffcf70', esc(cut(n.ask || n.tool, 42)))
   } else {
     s += T(x + 17, y + 77, 11, n.tool && live ? color : '#6f7694', esc(n.tool ? '⚙ ' + cut(n.tool, 36) : '— sin herramienta'), n.tool && live ? ' font-weight="600"' : '')
     if (n.lastError) s += T(x + 17, y + 91, 10.5, ERR_COLOR, esc('⚠ ' + cut(n.lastError, 42)))
@@ -239,18 +258,69 @@ const card = (n: FlowNode, x: number, y: number, now: number) => {
   if (n.skills.length) add(`✦ ${n.skills.length}`, SKILL_COLOR)
   if (n.mcp.length) add(`⛓ ${n.mcp.length}`, MCP_COLOR)
   if (n.files.length) add(`▤ ${n.files.length}`, WRITE_COLOR)
-  const tip = `${n.type} · ${n.desc || 'sin descripción'}\nEstado: ${st.label}\nHerramientas usadas: ${n.tools}`
-  return `<g><title>${esc(tip)}</title>${s}</g>`
+  const brief = n.prompt ? '\nEncargo:\n' + wrap(n.prompt, 80, 10).join('\n') : ''
+  const tip = `${n.type} · ${n.desc || 'sin descripción'}\nEstado: ${st.label}\nHerramientas usadas: ${n.tools}${brief}`
+  return `<g>${lite >= 1 ? '' : `<title>${esc(tip)}</title>`}${s}</g>`
 }
 
 type Pos = { x: number; y: number }
 type Use = { id: string; at: number; n: number; tool: string }
-type Kind = 'skill' | 'mcp' | 'file'
+type Kind = 'skill' | 'mcp' | 'tool' | 'file'
 type Res = { kind: Kind; label: string; color: string; uses: Use[]; at: number; n: number; rd: number; wr: number; y: number; slot: number }
 
 const isLive = (n: FlowNode) => n.status === 'active' || n.status === 'waiting'
 
+// ---------- línea de tiempo ----------
+// Una barra por agente con los últimos 5 min: tramos de trabajo (color del agente), esperas de permiso
+// (ámbar), una marca blanca por herramienta y una roja por fallo. Las marcas van en un solo <path> por
+// fila para que 60 marcas por agente no se acerquen al tope de tamaño del SVG.
+const TL_ROW = 22
+const TL_LABEL = 138
+const timeline = (nodes: Record<string, FlowNode>, order: string[], depthOf: (id: string) => number, now: number, W: number, y: number, withTicks: boolean) => {
+  const x0 = PAD + TL_LABEL
+  const x1 = W - PAD
+  const t0 = now - IDLE_MS
+  const X = (t: number) => Math.round((x0 + ((Math.min(Math.max(t, t0), now) - t0) / IDLE_MS) * (x1 - x0)) * 10) / 10
+  const ty = y + 16
+  const top = ty + 12
+  const bottom = top + order.length * TL_ROW
+  let s = `<line x1="${PAD}" x2="${W - PAD}" y1="${y + 2}" y2="${y + 2}" stroke="#23273a"/>`
+  s += T(PAD, ty, 10, '#8b93a7', 'LÍNEA DE TIEMPO · ÚLTIMOS 5 MIN', ' font-weight="700" letter-spacing="1.4"')
+  s += `<text x="${W - PAD}" y="${ty}" font-size="9.5" fill="#6f7694" ${FONT} text-anchor="end"><tspan fill="#8b93a7">▮</tspan> trabaja · <tspan fill="${WAIT_COLOR}">▮</tspan> espera permiso · <tspan fill="#fff">|</tspan> herramienta · <tspan fill="${ERR_COLOR}">|</tspan> fallo</text>`
+  order.forEach((id, i) => {
+    const n = nodes[id]
+    const ry = top + i * TL_ROW
+    const c = colorOf(n.type)
+    const d = depthOf(id)
+    const bar = (a: number, b: number, col: string, op: number) => `<rect x="${X(a)}" y="${ry + 6}" width="${Math.max(2, Math.round((X(b) - X(a)) * 10) / 10)}" height="10" rx="2" fill="${col}" fill-opacity="${op}"/>`
+    const ticks = (ts: number[], col: string, w: number) => {
+      const xs = [...new Set(ts.filter(t => t >= t0).map(X))]
+      return xs.length ? `<path d="${xs.map(x => `M${x} ${ry + 4}v14`).join('')}" stroke="${col}" stroke-width="${w}" stroke-opacity=".8" fill="none"/>` : ''
+    }
+    s += T(PAD + d * 8, ry + 15, 10.5, '#b9bfd9', esc(cut(n.type, Math.max(8, 19 - d * 2))))
+    s += `<rect x="${x0}" y="${ry + 4}" width="${x1 - x0}" height="14" rx="3" fill="#141725"/>`
+    for (const [a, b] of n.runs) if (b >= t0) s += bar(a, b, c, 0.5)
+    for (const [a, b] of n.waits) if ((b || now) >= t0) s += bar(a, b || now, WAIT_COLOR, 0.95)
+    s += (withTicks ? ticks(n.marks, '#ffffff', 1) : '') + ticks(n.errAt, ERR_COLOR, 2.4)
+  })
+  for (let m = 0; m <= 5; m++) {
+    const x = Math.round(x0 + ((x1 - x0) * m) / 5)
+    s += `<line x1="${x}" x2="${x}" y1="${top}" y2="${bottom}" stroke="#2a2f45" stroke-opacity=".7"/>`
+    s += T(x, bottom + 12, 9, '#5f6684', m === 5 ? 'ahora' : `-${5 - m}m`, ' text-anchor="middle"')
+  }
+  return { svg: s, h: bottom + 14 + PAD - y }
+}
+
+// El panel no dibuja un SVG de más de 128 KB. Con muchos agentes se aligera por pasos:
+// 1) sin tooltips ni líneas de las herramientas, 2) sin las marcas de la línea de tiempo.
+const SVG_BUDGET = 120_000
 export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1) => {
+  let r = render(nodes, now, scale, 0)
+  for (const lite of [1, 2]) if (r.source.length > SVG_BUDGET) r = render(nodes, now, scale, lite)
+  return r
+}
+
+const render = (nodes: Record<string, FlowNode>, now: number, scale: number, lite: number) => {
   const { ok, kids } = aliveSet(nodes, now)
   const ids = [...ok]
 
@@ -283,10 +353,11 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
       const n = nodes[id]
       const items =
         kind === 'skill' ? n.skills.map(s => ({ key: s.name, at: s.at, n: s.n, tool: '', rd: 0, wr: 0 }))
+        : kind === 'tool' ? n.toolUse.map(s => ({ key: s.name, at: s.at, n: s.n, tool: '', rd: 0, wr: 0 }))
         : kind === 'mcp' ? n.mcp.map(s => ({ key: s.server, at: s.at, n: s.n, tool: s.tool, rd: 0, wr: 0 }))
         : n.files.map(f => ({ key: f.path, at: f.at, n: f.r + f.w, tool: '', rd: f.r, wr: f.w }))
       for (const it of items) {
-        const r = m.get(it.key) ?? { kind, label: it.key, color: kind === 'skill' ? SKILL_COLOR : MCP_COLOR, uses: [], at: 0, n: 0, rd: 0, wr: 0, y: 0, slot: 0 }
+        const r = m.get(it.key) ?? { kind, label: it.key, color: kind === 'skill' ? SKILL_COLOR : kind === 'tool' ? TOOL_COLOR : MCP_COLOR, uses: [], at: 0, n: 0, rd: 0, wr: 0, y: 0, slot: 0 }
         r.uses.push({ id, at: it.at, n: it.n, tool: it.tool })
         r.at = Math.max(r.at, it.at)
         r.n += it.n
@@ -302,6 +373,7 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
   }
   const skillRes = collect('skill')
   const mcpRes = collect('mcp')
+  const toolRes = collect('tool')
   const fileRes = collect('file')
   const agentsRight = ids.length ? PAD + (maxDepth + 1) * CARD_W + maxDepth * HGAP : PAD + 400
   const cols: Array<{ kind: Kind; list: Res[]; x: number; title: string; color: string }> = []
@@ -309,6 +381,7 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
   for (const [kind, list, title, color] of [
     ['skill', skillRes, 'SKILLS', SKILL_COLOR],
     ['mcp', mcpRes, 'MCP', MCP_COLOR],
+    ['tool', toolRes, 'HERRAMIENTAS', TOOL_COLOR],
     ['file', fileRes, 'ARCHIVOS', WRITE_COLOR],
   ] as const) {
     if (!list.length) continue
@@ -339,14 +412,21 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
   }
   const resSlots = Math.max(0, ...cols.map(c => assign(c.list)))
 
-  const W = ids.length ? rightEdge + PAD : 560
-  const H = ids.length ? TOP + Math.max(row, resSlots) * SL - VGAP + PAD : 150
+  const W = ids.length ? Math.max(rightEdge + PAD, 560) : 560
+  const gridH = TOP + Math.max(row, resSlots) * SL - VGAP + PAD
+  // la línea de tiempo va debajo, una barra por agente en el orden del árbol
+  const order = ids
+    .filter(i => pos.has(i))
+    .sort((a, b) => pos.get(a)!.y - pos.get(b)!.y || pos.get(a)!.x - pos.get(b)!.x)
+  const tl = ids.length ? timeline(nodes, order, i => pos.get(i)!.x, now, W, gridH, lite < 2) : { svg: '', h: 0 }
+  const H = ids.length ? gridH + tl.h : 150
 
   const counts = {
     total: ids.length,
     active: ids.filter(i => isLive(nodes[i])).length,
     skills: skillRes.length,
     mcp: mcpRes.length,
+    tools: toolRes.length,
     files: fileRes.length,
     errors: ids.reduce((s, i) => s + nodes[i].errors, 0),
   }
@@ -365,6 +445,7 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
   let resEdges = ''
   for (const c of cols) {
     for (const r of c.list) {
+      if (lite >= 1 && r.kind === 'tool') continue
       for (const u of r.uses) {
         const n = nodes[u.id]
         const p = pos.get(u.id)!
@@ -382,10 +463,11 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
           d = `M${sx} ${sy} ${bez(sx, sy, x1, gy)} L${x2} ${gy} ${bez(x2, gy, c.x, ey)}`
         }
         const live = isLive(n) && now - u.at < LIVE_USE_MS
-        resEdges += `<path d="${d}" fill="none" stroke="${r.color}" stroke-width="${live ? 2.2 : 1.4}" stroke-opacity="${live ? 0.95 : 0.22}" stroke-linecap="round"/>`
+        const soft = r.kind === 'tool' // las herramientas son muchas: líneas más finas para no tapar el resto
+        resEdges += `<path d="${d}" fill="none" stroke="${r.color}" stroke-width="${live ? (soft ? 1.1 : 2.2) : soft ? 0.8 : 1.4}" stroke-opacity="${live ? (soft ? 0.4 : 0.95) : soft ? 0.07 : 0.22}" stroke-linecap="round"/>`
         if (live) {
-          resEdges += `<path d="${d}" fill="none" stroke="#fff" stroke-opacity=".7" stroke-width="1.3" stroke-dasharray="2 12" stroke-linecap="round"><animate attributeName="stroke-dashoffset" from="14" to="0" dur=".8s" repeatCount="indefinite"/></path>`
-          resEdges += `<circle r="3.2" fill="${r.color}" stroke="#fff" stroke-width="1"><animateMotion dur="${Math.max(1.4, 0.0016 * (c.x - sx + 400)).toFixed(2)}s" repeatCount="indefinite" path="${d}"/></circle>`
+          if (!soft) resEdges += `<path d="${d}" fill="none" stroke="#fff" stroke-opacity=".7" stroke-width="1.3" stroke-dasharray="2 12" stroke-linecap="round"><animate attributeName="stroke-dashoffset" from="14" to="0" dur=".8s" repeatCount="indefinite"/></path>`
+          if (!soft) resEdges += `<circle r="3.2" fill="${r.color}" stroke="#fff" stroke-width="1"><animateMotion dur="${Math.max(1.4, 0.0016 * (c.x - sx + 400)).toFixed(2)}s" repeatCount="indefinite" path="${d}"/></circle>`
         }
       }
     }
@@ -421,15 +503,15 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
   let cards = ''
   for (const id of ids) {
     const p = pos.get(id)
-    if (p) cards += card(nodes[id], ...px(p), now)
+    if (p) cards += card(nodes[id], ...px(p), now, lite)
   }
 
   // 3) nodos de skills, MCP y archivos
   const resNode = (r: Res, x: number) => {
     const live = r.uses.some(u => isLive(nodes[u.id]) && now - u.at < LIVE_USE_MS)
     const who = r.uses.map(u => nodes[u.id].type).filter((v, i, a) => a.indexOf(v) === i)
-    const icon = r.kind === 'skill' ? '✦' : r.kind === 'mcp' ? '⛓' : r.wr ? '✎' : '▤'
-    const name = r.kind === 'skill' ? r.label.replace(/^.*:/, '') : r.kind === 'mcp' ? friendlyMcp(r.label) : base(r.label)
+    const icon = r.kind === 'skill' ? '✦' : r.kind === 'mcp' ? '⛓' : r.kind === 'tool' ? '⚙' : r.wr ? '✎' : '▤'
+    const name = r.kind === 'skill' ? r.label.replace(/^.*:/, '') : r.kind === 'mcp' ? friendlyMcp(r.label) : r.kind === 'tool' ? r.label : base(r.label)
     const last = r.uses.reduce((a, b) => (b.at > a.at ? b : a))
     const when = live ? 'en uso' : 'hace ' + fmt(now - r.at)
     const sub =
@@ -444,7 +526,7 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
     s += T(x + 14, r.y + 20, 12.5, '#f4f6ff', `<tspan fill="${r.color}">${icon}</tspan> ${esc(cut(name, r.kind === 'file' ? 22 : 24))}`, ' font-weight="700"')
     s += T(x + 14, r.y + 35, 10, live ? r.color : '#8b93a7', esc(sub))
     s += T(x + 14, r.y + 47, 9.5, '#5f6684', esc(third))
-    return `<g><title>${esc(`${r.label}\n${r.n} uso(s) por ${who.join(', ')}`)}</title>${s}</g>`
+    return `<g>${lite >= 1 ? '' : `<title>${esc(`${r.label}\n${r.n} uso(s) por ${who.join(', ')}`)}</title>`}${s}</g>`
   }
   let resNodes = ''
   for (const c of cols) for (const r of c.list) resNodes += resNode(r, c.x)
@@ -475,13 +557,38 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
     W,
     H,
     counts,
-    alt: `Flujo de agentes: ${counts.total} agentes, ${counts.active} activos, ${counts.skills} skills, ${counts.mcp} MCP, ${counts.files} archivos, ${counts.errors} errores`,
-    source: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${Math.round(W * scale)}" height="${Math.round(H * scale)}"><rect width="${W}" height="${H}" fill="#0d0f17"/>${head}${resEdges}${edges}${cards}${resNodes}${empty}</svg>`,
+    alt: `Flujo de agentes: ${counts.total} agentes, ${counts.active} activos, ${counts.skills} skills, ${counts.mcp} MCP, ${counts.tools} herramientas, ${counts.files} archivos, ${counts.errors} errores`,
+    source: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${Math.round(W * scale)}" height="${Math.round(H * scale)}"><rect width="${W}" height="${H}" fill="#0d0f17"/>${head}${resEdges}${edges}${cards}${resNodes}${tl.svg}${empty}</svg>`,
   }
 }
 
 // ---------- versión de texto (terminal / CLI, donde no hay SVG) ----------
-export type TermRow = { depth: number; node: FlowNode; live: boolean; color: string; statusColor: string; statusLabel: string; age: string }
+export type TermRow = { depth: number; node: FlowNode; live: boolean; color: string; statusColor: string; statusLabel: string; age: string; line: Array<[string, string | undefined]> }
+
+// Línea de tiempo en texto: 30 casillas de 10 s. Cada casilla enseña lo más importante que pasó en ella:
+// fallo > espera de permiso > llamada a herramienta > trabajando > nada.
+export const termTimeline = (n: FlowNode, now: number, color: string, cells = 30): Array<[string, string | undefined]> => {
+  const t0 = now - IDLE_MS
+  const w = IDLE_MS / cells
+  const kind = new Array<number>(cells).fill(0)
+  const put = (a: number, b: number, k: number) => {
+    for (let i = Math.max(0, Math.floor((a - t0) / w)); i <= Math.min(cells - 1, Math.floor((b - t0) / w)); i++) kind[i] = Math.max(kind[i], k)
+  }
+  for (const [a, b] of n.runs) put(a, b, 1)
+  for (const t of n.marks) put(t, t, 2)
+  for (const [a, b] of n.waits) put(a, b || now, 3)
+  for (const t of n.errAt) put(t, t, 4)
+  const CH = ['·', '▃', '█', '▒', '✖']
+  const COL: Array<string | undefined> = [undefined, color, '#ffffff', WAIT_COLOR, ERR_COLOR]
+  const out: Array<[string, string | undefined]> = []
+  let prev = -1
+  for (const k of kind) {
+    if (k === prev) out[out.length - 1][0] += CH[k]
+    else out.push([CH[k], COL[k]])
+    prev = k
+  }
+  return out
+}
 
 export const termRows = (nodes: Record<string, FlowNode>, now: number) => {
   const { ok, kids } = aliveSet(nodes, now)
@@ -499,7 +606,8 @@ export const termRows = (nodes: Record<string, FlowNode>, now: number) => {
       color: colorOf(n.type),
       statusColor: st.color,
       statusLabel: st.label,
-      age: n.status === 'active' ? fmt(now - n.started) : n.status === 'waiting' ? 'espera tu permiso' : 'hace ' + fmt(now - n.last),
+      age: n.status === 'active' ? fmt(now - n.started) : n.status === 'waiting' ? 'espera permiso ' + fmt(now - (n.askAt || n.last)) : 'hace ' + fmt(now - n.last),
+      line: termTimeline(n, now, colorOf(n.type)),
     })
     for (const k of (kids.get(id) ?? []).filter(x => ok.has(x) && !seen.has(x)).sort((a, b) => nodes[a].started - nodes[b].started)) walk(k, depth + 1)
   }
