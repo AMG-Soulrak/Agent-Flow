@@ -76,10 +76,19 @@ export const shortModel = (m: string) => {
 
 // Estado, el que cuelga de quién y qué sigue visible: un agente cuenta como activo
 // mientras él o cualquiera de sus descendientes tenga actividad de hace menos de 5 min.
+// Padre efectivo: si el registrado no existe como tarjeta, cuelga de la sesión principal,
+// así nada queda suelto en la columna del principal.
+export const parentOf = (nodes: Record<string, FlowNode>, id: string): string | null => {
+  const p = nodes[id].parent
+  if (p && p !== id && nodes[p]) return p
+  return id !== MAIN_ID && nodes[MAIN_ID] ? MAIN_ID : null
+}
+
 export const aliveSet = (nodes: Record<string, FlowNode>, now: number) => {
   const kids = new Map<string, string[]>()
   for (const n of Object.values(nodes)) {
-    if (n.parent && nodes[n.parent] && n.parent !== n.id) kids.set(n.parent, [...(kids.get(n.parent) ?? []), n.id])
+    const p = parentOf(nodes, n.id)
+    if (p) kids.set(p, [...(kids.get(p) ?? []), n.id])
   }
   const eff = new Map<string, number>()
   const calc = (id: string, depth: number): number => {
@@ -258,7 +267,7 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
     return free
   }
   const roots = ids
-    .filter(i => { const p = nodes[i].parent; return !p || !ok.has(p) })
+    .filter(i => { const p = parentOf(nodes, i); return !p || !ok.has(p) })
     .sort((x, y) => (x === MAIN_ID ? -1 : y === MAIN_ID ? 1 : nodes[x].started - nodes[y].started))
   let row = 0
   roots.forEach(r => { if (!seen.has(r)) row = place(r, 0, row) })
@@ -384,7 +393,8 @@ export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1
   let edges = ''
   for (const id of ids) {
     const n = nodes[id]
-    const pp = n.parent && ok.has(n.parent) ? pos.get(n.parent) : undefined
+    const par = parentOf(nodes, id)
+    const pp = par && ok.has(par) ? pos.get(par) : undefined
     const cp = pos.get(id)
     if (!pp || !cp) continue
     const [x1, y1] = px(pp)
@@ -491,7 +501,7 @@ export const termRows = (nodes: Record<string, FlowNode>, now: number) => {
     for (const k of (kids.get(id) ?? []).filter(x => ok.has(x) && !seen.has(x)).sort((a, b) => nodes[a].started - nodes[b].started)) walk(k, depth + 1)
   }
   ids
-    .filter(i => { const p = nodes[i].parent; return !p || !ok.has(p) })
+    .filter(i => { const p = parentOf(nodes, i); return !p || !ok.has(p) })
     .sort((a, b) => (a === MAIN_ID ? -1 : b === MAIN_ID ? 1 : nodes[a].started - nodes[b].started))
     .forEach(r => { if (!seen.has(r)) walk(r, 0) })
   return rows

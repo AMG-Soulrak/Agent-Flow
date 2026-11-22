@@ -93,6 +93,9 @@ async function touch($: any, id: string | undefined, p: Patch, spawn?: { parent:
     if (!n) {
       const s = spawn ?? info ?? { parent: null, type: 'Claude', desc: 'Sesión principal' }
       n = mkNode(key, s.parent, s.type, s.desc, now)
+    } else if (spawn) {
+      // un evento del subagente pudo llegar antes que su lanzamiento: el lanzamiento trae el padre real
+      n = { ...n, parent: spawn.parent, type: spawn.type || n.type, desc: spawn.desc || n.desc }
     }
     n = { ...n, last: now }
     for (const q of patches) n = apply(n, q, now)
