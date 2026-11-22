@@ -68,6 +68,9 @@ export const addMcp = (n: FlowNode, server: string, tool: string, now: number): 
   return { ...n, mcp: [...n.mcp.filter(s => s.server !== server), { server, tool, at: now, n: (old?.n ?? 0) + 1 }].slice(-8) }
 }
 
+// Esfuerzo abreviado para que el chip del modelo no tape los demás.
+const EFFORT_SHORT: Record<string, string> = { low: 'low', medium: 'med', high: 'high', xhigh: 'xh', max: 'max' }
+
 // "claude-sonnet-5-5-20260301" -> "sonnet 5.5"; "haiku" -> "haiku".
 export const shortModel = (m: string) => {
   const x = /(haiku|sonnet|opus|fable)[-\s]?(\d+)?[-.]?(\d+)?/i.exec(m)
@@ -231,11 +234,11 @@ const card = (n: FlowNode, x: number, y: number, now: number) => {
   // resumen en chips: modelo, skills, MCP, archivos y fallos (el detalle está en las columnas de la derecha)
   let cx = x + 17
   const add = (txt: string, c: string) => { const ch = chip(cx, y + 99, txt, c); if (cx + ch.w < x + CARD_W - 8) { s += ch.svg; cx += ch.w + 4 } }
-  if (n.model) add('◈ ' + n.model, MODEL_COLOR)
+  if (n.model) add('◈ ' + n.model + (n.effort ? '·' + (EFFORT_SHORT[n.effort] ?? n.effort) : ''), MODEL_COLOR)
+  if (n.errors) add(`⚠ ${n.errors}`, ERR_COLOR)
   if (n.skills.length) add(`✦ ${n.skills.length}`, SKILL_COLOR)
   if (n.mcp.length) add(`⛓ ${n.mcp.length}`, MCP_COLOR)
   if (n.files.length) add(`▤ ${n.files.length}`, WRITE_COLOR)
-  if (n.errors) add(`⚠ ${n.errors}`, ERR_COLOR)
   const tip = `${n.type} · ${n.desc || 'sin descripción'}\nEstado: ${st.label}\nHerramientas usadas: ${n.tools}`
   return `<g><title>${esc(tip)}</title>${s}</g>`
 }

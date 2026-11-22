@@ -19,6 +19,8 @@ export type FlowNode = {
   files: FlowFile[]
   // modelo corto: "sonnet 5.5", "haiku"
   model: string
+  // esfuerzo del subagente ("low", "high"…); no lo da el motor para la sesión principal
+  effort?: string
   // herramientas que fallaron y el último mensaje de error
   errors: number
   lastError: string

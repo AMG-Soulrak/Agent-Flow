@@ -9,7 +9,7 @@ const PANE = 'agent-flow'
 const nodes = atom({ plugin: 'agent-flow', key: 'nodes' } as const, {} as Record<string, FlowNode>, { shape: 'nodes-3' })
 const zoom = atom({ plugin: 'agent-flow', key: 'zoom' } as const, 2)
 
-type Patch = Partial<Pick<FlowNode, 'status' | 'tool' | 'desc' | 'model' | 'result'>> & {
+type Patch = Partial<Pick<FlowNode, 'status' | 'tool' | 'desc' | 'model' | 'effort' | 'result'>> & {
   skill?: string
   mcp?: { server: string; tool: string }
   file?: { path: string; mode: 'read' | 'write' }
@@ -52,6 +52,7 @@ function apply(n: FlowNode, p: Patch, now: number): FlowNode {
   if (p.tool !== undefined) n = { ...n, tool: p.tool }
   if (p.desc) n = { ...n, desc: p.desc }
   if (p.model) n = { ...n, model: p.model }
+  if (p.effort) n = { ...n, effort: p.effort }
   if (p.result !== undefined) n = { ...n, result: p.result }
   if (p.isCall) n = { ...n, tools: n.tools + 1 }
   if (p.skill) n = addSkill(n, p.skill, now)
@@ -132,7 +133,9 @@ export const register: Register = on => {
 
   on('agent.spawn', async ($, e, next) => {
     const r = await next(e)
-    if (r.agentId) await touch($, r.agentId, { status: 'active', model: shortModel(r.model ?? e.model ?? '') }, { parent: e.parentAgentId ?? MAIN_ID, type: e.subagentType, desc: e.description })
+    const row = r.agentId ? (await Promise.resolve($.agent.list()).catch(() => [])).find((x: any) => x.id === r.agentId) : undefined
+    const effort = row?.effort ?? (e as any).effort
+    if (r.agentId) await touch($, r.agentId, { status: 'active', model: shortModel(r.model ?? e.model ?? ''), effort: effort == null ? undefined : String(effort) },{ parent: e.parentAgentId ?? MAIN_ID, type: e.subagentType, desc: e.description })
     return r
   })
 
@@ -201,7 +204,7 @@ export const register: Register = on => {
                   {pad}
                   <Text color={x.statusColor}>● </Text>
                   <Text bold color={x.color}>{n.type}</Text>
-                  <Text dimColor> {x.statusLabel} · {x.age}{n.model ? ' · ' + n.model : ''}</Text>
+                  <Text dimColor> {x.statusLabel} · {x.age}{n.model ? ' · ' + n.model + (n.effort ? ' · ' + n.effort : '') : ''}</Text>
                 </Text>
                 <Text dimColor>{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}{c(n.desc || 'sin descripción', 90)}</Text>
                 {n.tool ? <Text color={x.live ? x.color : undefined} dimColor={!x.live}>{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}⚙ {c(n.tool, 80)}</Text> : null}

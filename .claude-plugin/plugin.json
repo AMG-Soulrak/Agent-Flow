@@ -1,6 +1,6 @@
 {
   "name": "agent-flow",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Panel informativo en vivo: qué agente está activo, de quién cuelga cada subagente, qué skills usa y en qué trabaja, con líneas de flujo entre ellos.",
   "types": "./types/index.d.ts"
 }
