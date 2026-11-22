@@ -151,6 +151,15 @@ export const colorOf = (type: string) => {
   const f = FIXED.find(([k]) => t.startsWith(k))
   return f ? f[1] : hsl(hash(t.split(':')[0]) % 360, 66, 62)
 }
+// Departamento de un agente, para filtrar: "marketing-lead" -> "marketing", "ruflo-core:coder" -> "ruflo-core";
+// los agentes genéricos del motor (Explore, Plan, general-purpose…) van juntos en "otros".
+export const deptOf = (type: string) => {
+  const t = type.toLowerCase()
+  const f = FIXED.find(([k]) => t.startsWith(k))
+  if (f) return f[0]
+  if (t.endsWith('-lead')) return t.slice(0, -5)
+  return t.includes(':') ? t.split(':')[0] : 'otros'
+}
 const SKILL_COLOR = '#b197fc'
 const MCP_COLOR = '#38d9a9'
 const READ_COLOR = '#4dabf7'
@@ -270,6 +279,36 @@ type Res = { kind: Kind; label: string; color: string; uses: Use[]; at: number; 
 
 const isLive = (n: FlowNode) => n.status === 'active' || n.status === 'waiting'
 
+// ---------- filtros ----------
+// Opciones del filtro: todos, solo los que trabajan ahora y un departamento por cada uno que se ve.
+export const filterOptions = (nodes: Record<string, FlowNode>, now: number) => {
+  const { ok } = aliveSet(nodes, now)
+  const depts = [...new Set([...ok].filter(i => i !== MAIN_ID).map(i => deptOf(nodes[i].type)))].sort()
+  return [{ id: 'all', label: 'Todos' }, { id: 'active', label: 'Activos' }, ...depts.map(d => ({ id: 'dept:' + d, label: d }))]
+}
+
+// Deja los agentes que cumplen el filtro y, para que el árbol no quede roto, sus antecesores y la sesión principal.
+export const filterNodes = (nodes: Record<string, FlowNode>, now: number, f: string): Record<string, FlowNode> => {
+  if (f === 'all') return nodes
+  const { ok } = aliveSet(nodes, now)
+  const match = (n: FlowNode) => (f === 'active' ? isLive(n) : f.startsWith('dept:') ? deptOf(n.type) === f.slice(5) : true)
+  const keep = new Set<string>()
+  if (nodes[MAIN_ID]) keep.add(MAIN_ID)
+  for (const id of ok) {
+    if (id === MAIN_ID || !match(nodes[id])) continue
+    let cur: string | null = id
+    for (let guard = 0; cur && !keep.has(cur) && guard < 30; guard++) {
+      keep.add(cur)
+      cur = parentOf(nodes, cur)
+    }
+  }
+  return Object.fromEntries([...keep].map(i => [i, nodes[i] as FlowNode]))
+}
+
+// Vista congelada: sin animaciones (los puntos que viajan por las líneas se quitan enteros, sin ellas quedarían en una esquina).
+export const freezeSvg = (svg: string) =>
+  svg.replace(/<circle r="[^"]*"[^>]*>(?:<animate[^>]*\/>)*<animateMotion[^>]*\/><\/circle>/g, '').replace(/<animate(?:Motion)?\b[^>]*\/>/g, '')
+
 // ---------- línea de tiempo ----------
 // Una barra por agente con los últimos 5 min: tramos de trabajo (color del agente), esperas de permiso
 // (ámbar), una marca blanca por herramienta y una roja por fallo. Las marcas van en un solo <path> por
@@ -314,10 +353,10 @@ const timeline = (nodes: Record<string, FlowNode>, order: string[], depthOf: (id
 // El panel no dibuja un SVG de más de 128 KB. Con muchos agentes se aligera por pasos:
 // 1) sin tooltips ni líneas de las herramientas, 2) sin las marcas de la línea de tiempo.
 const SVG_BUDGET = 120_000
-export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1) => {
+export const drawFlow = (nodes: Record<string, FlowNode>, now: number, scale = 1, still = false) => {
   let r = render(nodes, now, scale, 0)
   for (const lite of [1, 2]) if (r.source.length > SVG_BUDGET) r = render(nodes, now, scale, lite)
-  return r
+  return still ? { ...r, source: freezeSvg(r.source) } : r
 }
 
 const render = (nodes: Record<string, FlowNode>, now: number, scale: number, lite: number) => {

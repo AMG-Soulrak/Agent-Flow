@@ -1,14 +1,25 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { FlowNode } from '../types'
-import { IDLE_MS, MAIN_ID, ZOOMS, addFile, addMcp, addSkill, addTool, aliveSet, colorOf, drawFlow, friendlyMcp, termRows, termShort, mcpOf, mkMain, mkNode, shortModel } from './flow'
+import type { FlowHist, FlowNode } from '../types'
+import { IDLE_MS, MAIN_ID, STATUS, ZOOMS, addFile, addMcp, addSkill, addTool, aliveSet, colorOf, drawFlow, filterNodes, filterOptions, fmt, friendlyMcp, termRows, termShort, mcpOf, mkMain, mkNode, shortModel } from './flow'
+import { clip, historyJson, parseHistory, snap, trimHist } from './history'
 
 const PANE = 'agent-flow'
 // Cambia la etiqueta si cambian los campos de un nodo: descarta lo guardado.
 const nodes = atom({ plugin: 'agent-flow', key: 'nodes' } as const, {} as Record<string, FlowNode>, { shape: 'nodes-4' })
 const zoom = atom({ plugin: 'agent-flow', key: 'zoom' } as const, 2)
 const briefs = atom({ plugin: 'agent-flow', key: 'briefs' } as const, false)
+// Vista congelada (los agentes y la hora del momento de pausar); null = en vivo.
+type Frozen = { at: number; nodes: Record<string, FlowNode> } | null
+const frozen = atom({ plugin: 'agent-flow', key: 'frozen' } as const, null as Frozen, { shape: 'frozen-1' })
+const filter = atom({ plugin: 'agent-flow', key: 'filter' } as const, 'all')
+const alerts = atom({ plugin: 'agent-flow', key: 'alerts' } as const, true)
+const sound = atom({ plugin: 'agent-flow', key: 'sound' } as const, false)
+const selected = atom({ plugin: 'agent-flow', key: 'selected' } as const, '')
+const showHistory = atom({ plugin: 'agent-flow', key: 'showHistory' } as const, false)
+const historyOn = atom({ plugin: 'agent-flow', key: 'historyOn' } as const, true)
+const history = atom({ plugin: 'agent-flow', key: 'history' } as const, {} as Record<string, FlowHist>, { shape: 'history-1' })
 
 type Patch = Partial<Pick<FlowNode, 'status' | 'tool' | 'desc' | 'prompt' | 'ask' | 'model' | 'effort' | 'result'>> & {
   toolName?: string
@@ -127,6 +138,53 @@ async function touch($: any, id: string | undefined, p: Patch, spawn?: { parent:
     for (const k of Object.keys(out)) if (k !== MAIN_ID && now - out[k].last > IDLE_MS * 2) delete out[k]
     return out
   })
+  dirty.add(key)
+}
+
+// ---------- avisos ----------
+// Un subagente terminó o falló: aviso emergente y, si se activó, un pitido. El sonido puede no oírse
+// (el motor no reproduce audio en todas las terminales): un fallo ahí nunca debe romper nada.
+async function notifyEnd($: any, n: FlowNode | undefined, kind: 'done' | 'failed') {
+  if (!n || n.id === MAIN_ID) return
+  try {
+    if (await read($, alerts)) {
+      const txt = kind === 'done' ? `✓ ${n.type} terminó${n.result ? ': ' + cut(n.result, 90) : ''}` : `✗ ${n.type} falló${n.lastError ? ': ' + cut(n.lastError, 90) : ''}`
+      $.ui.toast(txt, { timeoutMs: kind === 'failed' ? 9000 : 5000 })
+    }
+    if (await read($, sound)) await Promise.resolve($.audio.play({ base64: clip(kind), mime: 'audio/wav' }, { gain: 0.6 })).catch(() => {})
+  } catch {}
+}
+
+// ---------- historial ----------
+// Cada agente que se toca se anota (resumen, sin el encargo entero) en un atom y, si está activado,
+// en un archivo por sesión en la carpeta del usuario, no en la del proyecto (no acaba en un commit).
+const dirty = new Set<string>()
+let histLoaded = false
+let histPath = ''
+
+async function flushHistory($: any, force = false) {
+  const ids = [...dirty]
+  dirty.clear()
+  if (!ids.length && !force) return
+  const live = ids.length ? await read($, nodes) : {}
+  await update($, history, h => {
+    const out = { ...h }
+    for (const id of ids) if (id !== MAIN_ID && live[id]) out[id] = snap(live[id])
+    return trimHist(out)
+  })
+  if (!(await read($, historyOn))) return
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'))
+  if (!home) return
+  const sid = String(await $.session.id()).replace(/[^\w-]/g, '') || 'sesion'
+  const path = `${String(home).replace(/\\/g, '/')}/.claude/agent-flow/history/${sid}.json`
+  // al recargar el mod en plena sesión, lo ya guardado se recupera en lugar de pisarse
+  if (!histLoaded) {
+    histLoaded = true
+    const old = parseHistory(await Promise.resolve($.fs.read(path)).catch(() => ''))
+    if (Object.keys(old).length) await update($, history, h => trimHist({ ...old, ...h }))
+  }
+  await $.fs.write(path, historyJson(sid, await $.clock.now(), await read($, history)))
+  histPath = path
 }
 
 export const register: Register = on => {
@@ -136,17 +194,26 @@ export const register: Register = on => {
 
     // Solo se redibuja si hay algo que mostrar: cada 30 s para los contadores y el ocultado, y cada 10 s mientras
     // algún agente espera tu permiso (para que su cronómetro avance sin que el resto parpadee de más).
+    // En pausa no se redibuja nada, pero los avisos y el historial siguen su curso.
     let tick = 0
     $.clock.every(10000, async () => {
       const mine = await read($, nodes)
       const list: any[] = await $.agent.list()
       for (const a of list) {
         const cur = mine[a.id]?.status
-        if ((cur === 'active' || cur === 'waiting') && ['completed'].includes(a.status)) await touch($, a.id, { status: 'done' })
-        if ((cur === 'active' || cur === 'waiting') && ['failed', 'killed'].includes(a.status)) await touch($, a.id, { status: 'failed' })
+        const isLive = cur === 'active' || cur === 'waiting'
+        if (isLive && a.status === 'completed') {
+          await touch($, a.id, { status: 'done' })
+          await notifyEnd($, (await read($, nodes))[a.id], 'done')
+        }
+        if (isLive && ['failed', 'killed'].includes(a.status)) {
+          await touch($, a.id, { status: 'failed' })
+          await notifyEnd($, (await read($, nodes))[a.id], 'failed')
+        }
       }
+      await flushHistory($).catch(() => {})
       const waiting = Object.values(mine).some(n => n.status === 'waiting')
-      if (Object.keys(mine).length && (waiting || ++tick % 3 === 0)) $.ui.invalidate('ui.render')
+      if (Object.keys(mine).length && (waiting || ++tick % 3 === 0) && !(await read($, frozen))) $.ui.invalidate('ui.render')
     })
     return next(e)
   })
@@ -206,87 +273,214 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     // el subagente guarda lo que respondió (el principal no: su respuesta es el propio chat)
+    const prev = e.agentId ? (await read($, nodes))[e.agentId]?.status : undefined
     await touch($, e.agentId, e.agentId ? { status: 'done', result: cut(oneLine(e.answer), 140) } : { status: 'idle' })
+    if (e.agentId && prev !== 'done' && prev !== 'failed') await notifyEnd($, (await read($, nodes))[e.agentId], 'done')
+    return next(e)
+  })
+
+  // Al cerrar la sesión se guarda lo último (el límite de tiempo es corto: un fallo no debe retrasar la salida).
+  on('session.end', async ($, e, next) => {
+    await flushHistory($, true).catch(() => {})
     return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Svg, Text, Button } = $.ui.resolve(e)
     const z = await read($, zoom)
-    const now = await $.clock.now()
-    const all = await read($, nodes)
+    const real = await $.clock.now()
+    const fz = await read($, frozen)
+    const now = fz ? fz.at : real
+    // En pausa no se lee la lista viva: lo que pase mientras tanto no redibuja nada.
+    const all0 = fz ? fz.nodes : await read($, nodes)
+    const flt = await read($, filter)
+    const all = filterNodes(all0, now, flt)
+    const opts = filterOptions(all0, now)
+    const nextFlt = opts[(Math.max(0, opts.findIndex(o => o.id === flt)) + 1) % opts.length]
+    const fltLabel = flt === 'all' ? 'Todos' : flt === 'active' ? 'Activos' : flt.replace(/^dept:/, '')
     const showBriefs = await read($, briefs)
-    const toggleBriefs = () => update($, briefs, v => !v)
-    // encargos completos de los subagentes que siguen visibles, del más antiguo al más nuevo
+    const alertsOn = await read($, alerts)
+    const soundOn = await read($, sound)
+    const histOn = await read($, historyOn)
+    const viewHist = await read($, showHistory)
+    const sel = await read($, selected)
+    const histMap = viewHist ? await read($, history) : {}
+
+    const rows = termRows(all, now)
+    const selNode = sel ? all0[sel] : undefined
     const alive = aliveSet(all, now).ok
     const briefList = Object.values(all)
       .filter(n => n.id !== MAIN_ID && alive.has(n.id) && (n.prompt || n.desc))
       .sort((a, b) => a.started - b.started)
-    if (e.surface === 'terminal') {
-      const rows = termRows(all, now)
-      const { cut: c, base: b, friendly } = termShort
+
+    const bump = (d: number) => () => update($, zoom, n => Math.min(ZOOMS.length - 1, Math.max(0, n + d)))
+    const togglePause = async () => {
+      if (fz) return update($, frozen, () => null)
+      const snapNodes = await read($, nodes)
+      const at = await $.clock.now()
+      return update($, frozen, () => ({ at, nodes: snapNodes }))
+    }
+
+    const toolbar = (withZoom: boolean) => (
+      <Box flexDirection="column">
+        <Box flexWrap="wrap" columnGap={1}>
+          {withZoom ? <Button key="out" label="−" onPress={bump(-1)} /> : null}
+          {withZoom ? <Button key="in" label="+" onPress={bump(1)} /> : null}
+          <Button key="pause" label={fz ? '▶ Reanudar' : '⏸ Pausar'} onPress={togglePause} />
+          <Button key="filter" label={`Filtro: ${fltLabel}`} onPress={() => update($, filter, () => nextFlt.id)} />
+          <Button key="briefs" label={showBriefs ? 'Ocultar encargos' : 'Encargos'} onPress={() => update($, briefs, v => !v)} />
+          <Button key="hist" label={viewHist ? 'Ver gráfico' : 'Historial'} onPress={() => update($, showHistory, v => !v)} />
+          <Button key="clear" label="Limpiar" onPress={() => update($, nodes, () => ({}))} />
+        </Box>
+        <Box flexWrap="wrap" columnGap={1}>
+          <Button key="alerts" label={`Avisos: ${alertsOn ? 'sí' : 'no'}`} onPress={() => update($, alerts, v => !v)} />
+          <Button key="sound" label={`Sonido: ${soundOn ? 'sí' : 'no'}`} onPress={() => update($, sound, v => !v)} />
+          <Button key="save" label={`Guardar historial: ${histOn ? 'sí' : 'no'}`} onPress={() => update($, historyOn, v => !v)} />
+        </Box>
+        {fz ? <Text color="#ffb020">⏸ Vista congelada hace {fmt(real - fz.at)}. Los avisos y el historial siguen. Pulsa Reanudar para volver al directo.</Text> : null}
+        {flt !== 'all' ? <Text dimColor>Filtro «{fltLabel}»: {rows.length} de {Object.keys(all0).length} agentes</Text> : null}
+      </Box>
+    )
+
+    // Panel de detalle: todo de un agente, desplegable (el encargo y el resultado pueden llevar datos sensibles).
+    const detail = (n: FlowNode) => {
+      const st = STATUS[n.status]
+      const when = n.status === 'active' ? 'activo desde hace ' + fmt(now - n.started) : n.status === 'waiting' ? 'espera permiso desde hace ' + fmt(now - (n.askAt || n.last)) : st.label + ' hace ' + fmt(now - n.last)
       return (
-        <Box flexDirection="column">
-          <Box gap={1}>
-            <Button key="briefs" label={showBriefs ? 'Ocultar encargos' : 'Encargos'} onPress={toggleBriefs} />
-            <Button key="clear" label="Limpiar" onPress={() => update($, nodes, () => ({}))} />
-            <Text dimColor>{rows.filter(x => x.live).length} activos · {rows.length} agentes</Text>
-          </Box>
-          {rows.length === 0 && <Text dimColor>Sin actividad en los últimos 5 minutos.</Text>}
-          {rows.length > 0 && <Text dimColor>⏱ últimos 5 min, 10 s por casilla: ▃ trabaja · █ herramienta · ▒ espera permiso · ✖ fallo</Text>}
-          {rows.map(x => {
-            const n = x.node
-            const pad = '  '.repeat(x.depth) + (x.depth ? '└ ' : '')
-            const ind = '  '.repeat(x.depth) + (x.depth ? '  ' : '')
-            return (
-              <Box key={n.id} flexDirection="column" marginTop={1}>
-                <Text>
-                  {pad}
-                  <Text color={x.statusColor}>● </Text>
-                  <Text bold color={x.color}>{n.type}</Text>
-                  <Text dimColor> {x.statusLabel} · {x.age}{n.model ? ' · ' + n.model + (n.effort ? ' · ' + n.effort : '') : ''}</Text>
-                </Text>
-                <Text dimColor>{ind}{c(n.desc || 'sin descripción', 90)}</Text>
-                {showBriefs && n.prompt ? <Text dimColor>{ind}“{n.prompt}”</Text> : null}
-                {n.status === 'waiting' && n.ask ? <Text color="#ffb020">{ind}⏸ pide permiso: {c(n.ask, 120)}</Text> : null}
-                {n.tool ? <Text color={x.live ? x.color : undefined} dimColor={!x.live}>{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}⚙ {c(n.tool, 80)}</Text> : null}
-                {n.toolUse.length ? <Text color="#ffe066">{ind}≡ {n.toolUse.map(t => t.name + '×' + t.n).join(', ')}</Text> : null}
-                {n.skills.length ? <Text color="#b197fc">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}✦ {n.skills.map(s => s.name.replace(/^.*:/, '')).join(', ')}</Text> : null}
-                {n.mcp.length ? <Text color="#38d9a9">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}⛓ {n.mcp.map(m => friendly(m.server) + '·' + m.tool).join(', ')}</Text> : null}
-                {n.files.length ? <Text color="#ffa94d">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}▤ {n.files.map(f => (f.w ? '✎' : '') + b(f.path)).join(', ')}</Text> : null}
-                {n.lastError ? <Text color="#ff6b6b">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}⚠ {c(n.lastError, 90)}</Text> : null}
-                {n.result && !x.live ? <Text color="#8fd3b6">{'  '.repeat(x.depth)}{x.depth ? '  ' : ''}↳ {c(n.result, 110)}</Text> : null}
-                <Text>{ind}<Text dimColor>⏱ </Text>{x.line.map((seg, i) => <Text key={i} color={seg[1]} dimColor={!seg[1]}>{seg[0]}</Text>)}</Text>
-              </Box>
-            )
-          })}
+        <Box key={`d-${n.id}`} flexDirection="column" marginTop={1} borderStyle="round" paddingX={1}>
+          <Text>
+            <Text bold color={colorOf(n.type)}>{n.type}</Text>
+            <Text color={st.color}> ● {st.label}</Text>
+            <Text dimColor> · {when}{n.model ? ' · ' + n.model + (n.effort ? ' · ' + n.effort : '') : ''} · {n.tools} llamadas</Text>
+          </Text>
+          {n.desc ? <Text>{n.desc}</Text> : null}
+          {n.prompt ? <Text dimColor>{n.prompt}</Text> : null}
+          {n.status === 'waiting' && n.ask ? <Text color="#ffb020">⏸ Pide permiso: {n.ask}</Text> : null}
+          {n.skills.length ? <Text color="#b197fc">✦ Skills: {n.skills.map(s => s.name + ' ×' + s.n).join(', ')}</Text> : null}
+          {n.mcp.length ? <Text color="#38d9a9">⛓ MCP: {n.mcp.map(m => friendlyMcp(m.server) + '·' + m.tool + ' ×' + m.n).join(', ')}</Text> : null}
+          {n.toolUse.length ? <Text color="#ffe066">≡ Herramientas: {n.toolUse.map(t => t.name + ' ×' + t.n).join(', ')}</Text> : null}
+          {n.files.map(f => (
+            <Text key={f.path} color="#ffa94d">
+              {f.w ? '✎' : '▤'} {f.path}
+              <Text dimColor> ({f.w ? `editado ${f.w}×` : ''}{f.w && f.r ? ' · ' : ''}{f.r ? `leído ${f.r}×` : ''})</Text>
+            </Text>
+          ))}
+          {n.errors ? <Text color="#ff6b6b">⚠ {n.errors} fallo{n.errors > 1 ? 's' : ''}. Último: {n.lastError}</Text> : null}
+          {n.result ? <Text color="#8fd3b6">↳ {n.result}</Text> : null}
+          <Button key="close" label="Cerrar detalle" onPress={() => update($, selected, () => '')} />
         </Box>
       )
     }
-    const { source, alt, W, H, counts } = drawFlow(all, now, ZOOMS[z] ?? 1)
-    const bump = (d: number) => () => update($, zoom, n => Math.min(ZOOMS.length - 1, Math.max(0, n + d)))
+    const picker = (
+      <Box flexDirection="column" marginTop={1}>
+        <Text bold dimColor>DETALLE · elige un agente</Text>
+        {rows.length === 0 ? <Text dimColor>Ningún agente visible.</Text> : null}
+        <Box flexWrap="wrap" columnGap={1}>
+          {rows.map(x => (
+            <Button key={`sel-${x.node.id}`} label={`${x.node.id === sel ? '▶ ' : ''}${'· '.repeat(x.depth)}${x.node.type}`} onPress={() => update($, selected, v => (v === x.node.id ? '' : x.node.id))} />
+          ))}
+        </Box>
+        {selNode ? detail(selNode) : sel ? <Text dimColor>Ese agente ya no está visible.</Text> : null}
+      </Box>
+    )
+
+    // Historial: todos los agentes de la sesión, también los que ya salieron del gráfico por inactividad.
+    const histRows = Object.values(histMap).filter(r => r.id !== MAIN_ID).sort((a, b) => b.last - a.last)
+    const historyView = (
+      <Box flexDirection="column" marginTop={1}>
+        <Text bold>HISTORIAL DE ESTA SESIÓN · {histRows.length} agentes</Text>
+        <Text dimColor>{histOn ? (histPath ? `Guardado en ${histPath}` : 'Se guarda en la carpeta .claude/agent-flow/history de tu usuario') : 'Guardar en archivo está desactivado (el historial de aquí sigue en memoria)'}</Text>
+        {histRows.length === 0 ? <Text dimColor>Todavía no hay agentes en el historial.</Text> : null}
+        {histRows.map(r => {
+          const st = STATUS[r.status]
+          return (
+            <Box key={r.id} flexDirection="column" marginTop={1}>
+              <Text>
+                <Text color={st.color}>● </Text>
+                <Text bold color={colorOf(r.type)}>{r.type}</Text>
+                <Text dimColor> {st.label} · duró {fmt(r.last - r.started)} · hace {fmt(real - r.last)} · {r.tools} llamadas{r.errors ? ` · ${r.errors} fallos` : ''}{r.model ? ' · ' + r.model + (r.effort ? ' · ' + r.effort : '') : ''}</Text>
+              </Text>
+              {r.desc ? <Text dimColor>{cut(r.desc, 140)}</Text> : null}
+              {r.result ? <Text color="#8fd3b6">↳ {r.result}</Text> : null}
+              {r.lastError ? <Text color="#ff6b6b">⚠ {r.lastError}</Text> : null}
+              {r.files.length ? <Text color="#ffa94d">▤ {r.files.map(f => (f.w ? '✎' : '') + f.path.split(/[\\/]/).pop()).join(', ')}</Text> : null}
+            </Box>
+          )
+        })}
+        <Button key="histclear" label="Borrar historial" onPress={() => update($, history, () => ({}))} />
+      </Box>
+    )
+
+    if (e.surface === 'terminal') {
+      const { cut: c, base: b, friendly } = termShort
+      return (
+        <Box flexDirection="column">
+          {toolbar(false)}
+          <Text dimColor>{rows.filter(x => x.live).length} activos · {rows.length} agentes</Text>
+          {viewHist ? (
+            historyView
+          ) : (
+            <Box flexDirection="column">
+              {rows.length === 0 && <Text dimColor>Sin actividad en los últimos 5 minutos.</Text>}
+              {rows.length > 0 && picker}
+              {rows.length > 0 && <Text dimColor>⏱ últimos 5 min, 10 s por casilla: ▃ trabaja · █ herramienta · ▒ espera permiso · ✖ fallo</Text>}
+              {rows.map(x => {
+                const n = x.node
+                const pad = '  '.repeat(x.depth) + (x.depth ? '└ ' : '')
+                const ind = '  '.repeat(x.depth) + (x.depth ? '  ' : '')
+                return (
+                  <Box key={n.id} flexDirection="column" marginTop={1}>
+                    <Text>
+                      {pad}
+                      <Text color={x.statusColor}>● </Text>
+                      <Text bold color={x.color}>{n.type}</Text>
+                      <Text dimColor> {x.statusLabel} · {x.age}{n.model ? ' · ' + n.model + (n.effort ? ' · ' + n.effort : '') : ''}</Text>
+                    </Text>
+                    <Text dimColor>{ind}{c(n.desc || 'sin descripción', 90)}</Text>
+                    {showBriefs && n.prompt ? <Text dimColor>{ind}“{n.prompt}”</Text> : null}
+                    {n.status === 'waiting' && n.ask ? <Text color="#ffb020">{ind}⏸ pide permiso: {c(n.ask, 120)}</Text> : null}
+                    {n.tool ? <Text color={x.live ? x.color : undefined} dimColor={!x.live}>{ind}⚙ {c(n.tool, 80)}</Text> : null}
+                    {n.toolUse.length ? <Text color="#ffe066">{ind}≡ {n.toolUse.map(t => t.name + '×' + t.n).join(', ')}</Text> : null}
+                    {n.skills.length ? <Text color="#b197fc">{ind}✦ {n.skills.map(s => s.name.replace(/^.*:/, '')).join(', ')}</Text> : null}
+                    {n.mcp.length ? <Text color="#38d9a9">{ind}⛓ {n.mcp.map(m => friendly(m.server) + '·' + m.tool).join(', ')}</Text> : null}
+                    {n.files.length ? <Text color="#ffa94d">{ind}▤ {n.files.map(f => (f.w ? '✎' : '') + b(f.path)).join(', ')}</Text> : null}
+                    {n.lastError ? <Text color="#ff6b6b">{ind}⚠ {c(n.lastError, 90)}</Text> : null}
+                    {n.result && !x.live ? <Text color="#8fd3b6">{ind}↳ {c(n.result, 110)}</Text> : null}
+                    <Text>{ind}<Text dimColor>⏱ </Text>{x.line.map((seg, i) => <Text key={i} color={seg[1]} dimColor={!seg[1]}>{seg[0]}</Text>)}</Text>
+                  </Box>
+                )
+              })}
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    const { source, alt, W, H, counts } = drawFlow(all, now, ZOOMS[z] ?? 1, !!fz)
     return (
       <Box flexDirection="column" alignItems="flex-start">
-        <Box gap={1}>
-          <Button key="out" label="−" onPress={bump(-1)} />
-          <Button key="in" label="+" onPress={bump(1)} />
-          <Button key="briefs" label={showBriefs ? 'Ocultar encargos' : 'Encargos'} onPress={toggleBriefs} />
-          <Button key="clear" label="Limpiar" onPress={() => update($, nodes, () => ({}))} />
-          <Text dimColor>
-            {counts.active} activos · {counts.total} agentes · {counts.skills} skills · {counts.mcp} MCP · {counts.tools} herramientas · {counts.files} archivos{counts.errors ? ` · ${counts.errors} fallos` : ''} · zoom {Math.round((ZOOMS[z] ?? 1) * 100)}%
-          </Text>
-        </Box>
-        <Svg source={source} alt={alt} width={Math.round(W * (ZOOMS[z] ?? 1))} height={Math.round(H * (ZOOMS[z] ?? 1))} />
-        {showBriefs && (
-          <Box flexDirection="column" marginTop={1}>
-            <Text bold>ENCARGOS</Text>
-            {briefList.length === 0 && <Text dimColor>Ningún subagente visible.</Text>}
-            {briefList.map(n => (
-              <Box key={n.id} flexDirection="column" marginTop={1}>
-                <Text bold color={colorOf(n.type)}>{n.type}{n.desc ? ' · ' + n.desc : ''}</Text>
-                <Text dimColor>{n.prompt || 'Sin texto de encargo.'}</Text>
+        {toolbar(true)}
+        <Text dimColor>
+          {counts.active} activos · {counts.total} agentes · {counts.skills} skills · {counts.mcp} MCP · {counts.tools} herramientas · {counts.files} archivos{counts.errors ? ` · ${counts.errors} fallos` : ''} · zoom {Math.round((ZOOMS[z] ?? 1) * 100)}%
+        </Text>
+        {viewHist ? (
+          historyView
+        ) : (
+          <Box flexDirection="column" alignItems="flex-start">
+            <Svg source={source} alt={alt} width={Math.round(W * (ZOOMS[z] ?? 1))} height={Math.round(H * (ZOOMS[z] ?? 1))} />
+            {picker}
+            {showBriefs && (
+              <Box flexDirection="column" marginTop={1}>
+                <Text bold>ENCARGOS</Text>
+                {briefList.length === 0 && <Text dimColor>Ningún subagente visible.</Text>}
+                {briefList.map(n => (
+                  <Box key={n.id} flexDirection="column" marginTop={1}>
+                    <Text bold color={colorOf(n.type)}>{n.type}{n.desc ? ' · ' + n.desc : ''}</Text>
+                    <Text dimColor>{n.prompt || 'Sin texto de encargo.'}</Text>
+                  </Box>
+                ))}
               </Box>
-            ))}
+            )}
           </Box>
         )}
       </Box>

@@ -46,6 +46,27 @@ export type FlowNode = {
   last: number
 }
 
+// Resumen de un agente para el historial: lo que cabe en un archivo y se puede compartir sin enseñar el encargo entero
+export type FlowHist = {
+  id: string
+  parent: string | null
+  type: string
+  desc: string
+  status: FlowNode['status']
+  model: string
+  effort?: string
+  started: number
+  last: number
+  tools: number
+  errors: number
+  lastError: string
+  result: string
+  skills: string[]
+  mcp: string[]
+  toolUse: string[]
+  files: Array<{ path: string; r: number; w: number }>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'agent-flow': {
@@ -54,6 +75,20 @@ declare module 'claude-code' {
       zoom: number
       // si se ve la lista de encargos completos bajo el gráfico
       briefs: boolean
+      // vista congelada: los agentes tal como estaban y la hora; null = en vivo
+      frozen: Shaped<{ at: number; nodes: Record<string, FlowNode> } | null>
+      // "all", "active" o "dept:<departamento>"
+      filter: string
+      // aviso emergente al terminar o fallar un subagente, y su sonido
+      alerts: boolean
+      sound: boolean
+      // agente elegido para el panel de detalle ('' = ninguno)
+      selected: string
+      // si se ve el historial en lugar del gráfico
+      showHistory: boolean
+      // si se guarda el historial en un archivo
+      historyOn: boolean
+      history: Shaped<Record<string, FlowHist>>
     }
   }
 }
