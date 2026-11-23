@@ -60,9 +60,67 @@ Debajo del gráfico hay una fila por agente con los últimos 5 minutos: cuándo 
 
 El panel guarda en el estado de la sesión el encargo de cada subagente (hasta 1200 caracteres) y su resultado. Con **Guardar historial** activado, que es el valor por defecto, además escribe un resumen por sesión en `~/.claude/agent-flow/history/<sesión>.json` con la descripción, el resultado, el último error y las rutas de los archivos de cada agente, pero no el encargo completo. Si no lo quieres, desactiva el botón **Guardar historial** en el panel.
 
+## Requisitos
+
+- **Claude Code 2.1.275 o posterior** (la instalación desde un repositorio de GitHub en un solo paso se añadió en esa versión). Probado con la versión 2.1.322 de la línea de comandos y con Claude Desktop.
+- **Claude Desktop** para ver el gráfico SVG con las líneas de flujo. En la terminal el panel se ve como un árbol de texto.
+- **Acceso a GitHub** para añadir el repositorio como fuente de plugins.
+- No hace falta Node, npm ni compilar nada: el mod se carga tal cual.
+- Probado en Windows 11 con PowerShell. El historial se guarda en `~/.claude/agent-flow/history/`, así que necesita poder escribir en esa carpeta (ver Privacidad).
+- El **sonido** de los avisos depende de la terminal: no todas reproducen audio. Está desactivado por defecto.
+
 ## Instalación
 
-Copia esta carpeta en la carpeta de mods de Claude Code y reinicia la sesión.
+### Desde GitHub (recomendado)
+
+Dentro de Claude Code:
+
+```
+/plugin install agent-flow --marketplace AMG-Soulrak/Agent-Mod-for-Claude
+```
+
+O desde la terminal:
+
+```
+claude plugin install agent-flow --marketplace AMG-Soulrak/Agent-Mod-for-Claude
+```
+
+Reinicia la sesión y escribe `/flow`. El plugin se instala a nivel de usuario, así que se carga en todas tus sesiones.
+
+Para actualizarlo cuando haya una versión nueva (hace falta reiniciar para aplicarla):
+
+```
+claude plugin update agent-flow
+```
+
+Para quitarlo:
+
+```
+claude plugin uninstall agent-flow
+```
+
+### Desde una copia local
+
+Si prefieres instalar desde una copia de esta carpeta (por ejemplo, para probar cambios), crea un marketplace local con ella. En **PowerShell**, desde la carpeta del repositorio:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.claude\local-marketplace\.claude-plugin", "$HOME\.claude\local-marketplace\agent-flow" | Out-Null
+Copy-Item -Recurse -Force ".claude-plugin", "hooks", "types", "LICENSE", "README.md" "$HOME\.claude\local-marketplace\agent-flow\"
+Remove-Item -Recurse -Force "$HOME\.claude\local-marketplace\agent-flow\.claude-plugin\types" -ErrorAction SilentlyContinue
+Set-Content -Encoding ascii "$HOME\.claude\local-marketplace\.claude-plugin\marketplace.json" '{"name":"local-mods","owner":{"name":"tu-nombre"},"plugins":[{"name":"agent-flow","source":"./agent-flow","description":"Panel en vivo de agentes, skills, MCP y archivos"}]}'
+claude plugin marketplace add "$HOME\.claude\local-marketplace"
+claude plugin install agent-flow@local-mods
+```
+
+Reinicia la sesión y escribe `/flow`. Esta forma instala una **copia**: tras cambiar el código, vuelve a ejecutar el segundo paso y luego `claude plugin update agent-flow@local-mods`.
+
+### Comprobar la instalación
+
+```
+claude plugin list
+```
+
+Debe aparecer `agent-flow` como `enabled`.
 
 ## Licencia
 

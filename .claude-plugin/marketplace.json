@@ -1,0 +1,11 @@
+{
+  "name": "agent-mod-for-claude",
+  "owner": { "name": "AMG-Soulrak" },
+  "plugins": [
+    {
+      "name": "agent-flow",
+      "source": "./",
+      "description": "Panel informativo en vivo: qué agente está activo, de quién cuelga cada subagente, qué skills, MCP, herramientas y archivos usa, con líneas de flujo entre ellos."
+    }
+  ]
+}
